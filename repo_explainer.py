@@ -457,22 +457,67 @@ def run_agent(
     client = anthropic.Anthropic(api_key=api_key)
     messages = [{"role": "user", "content": f"Repo: {repo_url}\n\nExplore it and write the report."}]
 
+    def extract_text(response) -> str:
+        return "".join(b.text for b in response.content if getattr(b, "type", None) == "text")
+
     for iteration in range(1, max_iterations + 1):
         # On the final allowed iteration, force a written answer instead of
-        # another tool call, so we always end with a real report rather than
-        # silently running out of budget mid-exploration.
+        # another tool call. Two belts, one suspender: an explicit instruction
+        # message (models respond much more reliably to an explicit "stop and
+        # answer now" than to tool_choice alone) PLUS tool_choice: none as a
+        # hard guarantee the API won't let it call a tool even if it tries.
         force_answer = iteration == max_iterations
-        response = client.messages.create(
-            model=model,
-            max_tokens=1500,
-            system=AGENT_SYSTEM_PROMPT,
-            tools=AGENT_TOOLS,
-            tool_choice={"type": "auto"} if not force_answer else {"type": "none"},
-            messages=messages,
-        )
+        if force_answer:
+            messages.append({
+                "role": "user",
+                "content": (
+                    "You've used your exploration budget. Do not call any more "
+                    "tools. Write your final report right now, in the Markdown "
+                    "format from the system prompt, based on everything you've "
+                    "read so far."
+                ),
+            })
+
+        try:
+            response = client.messages.create(
+                model=model,
+                max_tokens=1500,
+                system=AGENT_SYSTEM_PROMPT,
+                tools=AGENT_TOOLS,
+                tool_choice={"type": "auto"} if not force_answer else {"type": "none"},
+                messages=messages,
+            )
+        except anthropic.APIError as e:
+            print(f"API error during agent exploration: {e}", file=sys.stderr)
+            sys.exit(1)
 
         if response.stop_reason != "tool_use":
-            report = "".join(b.text for b in response.content if hasattr(b, "text"))
+            report = extract_text(response)
+            if not report.strip():
+                # Defensive fallback: should not happen given the explicit
+                # instruction above, but never silently return nothing.
+                print(
+                    f"Warning: model returned no text (stop_reason={response.stop_reason!r}). "
+                    "Retrying once with an explicit final request.",
+                    file=sys.stderr,
+                )
+                messages.append({"role": "assistant", "content": response.content})
+                messages.append({
+                    "role": "user",
+                    "content": "That produced no report text. Please write the Markdown report now.",
+                })
+                retry = client.messages.create(
+                    model=model,
+                    max_tokens=1500,
+                    system=AGENT_SYSTEM_PROMPT,
+                    tools=AGENT_TOOLS,
+                    tool_choice={"type": "none"},
+                    messages=messages,
+                )
+                report = extract_text(retry) or (
+                    "Agent exploration finished but produced no report text after a retry. "
+                    "Try again, or increase --max-iterations."
+                )
             if print_live:
                 print(report)
             return report
@@ -496,8 +541,8 @@ def run_agent(
             tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
         messages.append({"role": "user", "content": tool_results})
 
-    # Should be unreachable: the force_answer branch on the last iteration
-    # always returns. Kept as a safety net.
+    # Unreachable in practice: the force_answer branch on the last iteration
+    # always returns (with a retry fallback above). Kept as a last resort.
     return "Agent ran out of iterations without producing a final report."
 
 
