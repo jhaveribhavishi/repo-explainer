@@ -87,11 +87,14 @@ pytest tests/
 
 ## Why I built this
 
-I wanted a small project that actually *does* something with an LLM beyond
-chat — orchestrating file I/O, managing a token budget, and producing a
-structured, useful artifact from unstructured input (an arbitrary codebase).
-It's also genuinely useful: I use it to quickly get oriented in unfamiliar
-repos before diving in.
+My background is in network and cloud infrastructure engineering — a field
+built around making sense of complex systems quickly: telemetry, topology,
+signal-to-noise, root cause. This project applies the same instinct to
+codebases instead of networks. I wanted something that actually *does*
+something with an LLM beyond chat — orchestrating file I/O, managing a
+token budget, and producing a structured, useful artifact from unstructured
+input (an arbitrary codebase) — and that I'd genuinely use myself to get
+oriented in unfamiliar repos before diving in.
 
 ## Limitations / next steps
 
