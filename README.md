@@ -44,11 +44,11 @@ python repo_explainer.py octocat/Hello-World --output report.md
 python repo_explainer.py pallets/flask --dry-run
 
 # Get a longer, more detailed report (slower, bigger context budget)
-python repo_explainer.py pallets/flask --thorough
+python repo_explainer.py pallets/flask --detailed
 ```
 
 By default the report is quick (~200 words, a smaller slice of the repo sent
-to the model). Pass `--thorough` for a longer, more detailed analysis at the
+to the model). Pass `--detailed` for a longer, more detailed analysis at the
 cost of a slower response.
 
 `owner/repo` shorthand works too, not just full URLs.
