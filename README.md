@@ -2,12 +2,18 @@
 
 An AI agent that reads any public GitHub repo and explains it in plain
 English — what it does, how it's architected, what stack it uses, and how
-to run it. Point it at a repo URL and get back a concise Markdown report in
-seconds.
+to run it. Point it at a repo URL and get back a concise Markdown report.
+Runtime scales with repo size: a few seconds for a small repo, up to
+30-45 seconds for a large one (most of that is the git clone and the model's
+generation time, not the tool's own overhead).
 
-Built as a small, self-contained demo of an "agentic" workflow: the script
-does real work (cloning, scanning, and reasoning about an unfamiliar
-codebase) rather than just wrapping a chat prompt.
+This isn't an "agent" in the strict sense of a model making autonomous,
+looping tool-use decisions — the pipeline (clone → scan → select files →
+prompt) is fixed, deterministic Python. What it does demonstrate is real
+orchestration around a single well-crafted LLM call: shallow cloning,
+file-tree filtering, a heuristic for picking the highest-signal files, and
+a hard character budget to keep the prompt within a sane context size —
+not just a thin wrapper around a chat prompt.
 
 ## What it does
 
@@ -67,6 +73,18 @@ Flask is a lightweight WSGI web application framework for Python...
 
 ## Architecture / how it's organized
 The core app lives in `src/flask/app.py`, defining the `Flask` class...
+```
+
+## Testing
+
+The deterministic logic (URL parsing, secret-file filtering, file-tree
+building, the file-selection heuristic) has unit test coverage in `tests/`.
+The API call itself isn't unit tested since it requires network access and
+a key -- use `--dry-run` to sanity-check the prompt it would send instead.
+
+```bash
+pip install -r requirements-dev.txt
+pytest tests/
 ```
 
 ## Why I built this

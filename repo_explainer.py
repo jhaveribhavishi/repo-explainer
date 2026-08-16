@@ -40,6 +40,19 @@ SKIP_FILE_SUFFIXES = {
     ".min.js", ".min.css",
 }
 
+# Filenames that commonly hold secrets. Even though we only read files from
+# a fresh clone (not the user's own machine), a repo can accidentally have
+# these committed -- we never want to read them, let alone ship their
+# contents to a third-party API as part of the prompt.
+SKIP_SECRET_FILENAMES = {
+    ".env", ".env.local", ".env.development", ".env.production",
+    "credentials.json", "credentials.yml", "credentials.yaml",
+    "secrets.json", "secrets.yml", "secrets.yaml",
+    "id_rsa", "id_rsa.pub", "id_ed25519", "id_ed25519.pub",
+    ".npmrc", ".pypirc", ".netrc",
+}
+SKIP_SECRET_SUFFIXES = (".pem", ".key", ".pfx", ".p12", ".keystore")
+
 # Files we always prioritize including in full if present (highest value signal)
 PRIORITY_FILES = [
     "README.md", "README.rst", "README.txt", "README",
@@ -116,7 +129,19 @@ def build_file_tree(root: Path, max_entries: int = 400) -> str:
     return "\n".join(lines)
 
 
+def is_probably_secret(path: Path) -> bool:
+    """True if this file commonly holds credentials and must never be read,
+    even if it happens to be committed in the target repo."""
+    if path.name in SKIP_SECRET_FILENAMES:
+        return True
+    if path.name.endswith(SKIP_SECRET_SUFFIXES):
+        return True
+    return False
+
+
 def is_probably_text(path: Path) -> bool:
+    if is_probably_secret(path):
+        return False
     if any(path.name.endswith(suf) for suf in SKIP_FILE_SUFFIXES):
         return False
     try:
