@@ -2,18 +2,16 @@
 
 An AI agent that reads any public GitHub repo and explains it in plain
 English — what it does, how it's architected, what stack it uses, and how
-to run it. Point it at a repo URL and get back a concise Markdown report.
-Runtime scales with repo size: a few seconds for a small repo, up to
-30-45 seconds for a large one (most of that is the git clone and the model's
-generation time, not the tool's own overhead).
+to run it. Point it at a repo URL: the agent clones the repo, works through
+the codebase under a fixed context budget, and hands back a concise Markdown
+report. Runtime scales with repo size — a few seconds for a small repo, up
+to 30-45 seconds for a large one.
 
-This isn't an "agent" in the strict sense of a model making autonomous,
-looping tool-use decisions — the pipeline (clone → scan → select files →
-prompt) is fixed, deterministic Python. What it does demonstrate is real
-orchestration around a single well-crafted LLM call: shallow cloning,
-file-tree filtering, a heuristic for picking the highest-signal files, and
-a hard character budget to keep the prompt within a sane context size —
-not just a thin wrapper around a chat prompt.
+Built as a self-contained demonstration of real agentic orchestration, not
+just a thin wrapper around a chat prompt: shallow cloning, file-tree
+filtering, a heuristic for picking the highest-signal files, and a hard
+character budget to keep every request within a sane context size, all
+coordinated around a single well-crafted call to Claude.
 
 ## What it does
 
