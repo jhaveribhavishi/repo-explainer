@@ -282,6 +282,225 @@ def call_claude(prompt: str, model: str, print_live: bool = False, max_tokens: i
     return "".join(chunks)
 
 
+# =========================================================================
+# Agentic mode (--agent): a real tool-use loop.
+#
+# Everything above this point is a FIXED pipeline: Python decides which
+# files matter (collect_file_contents), Python builds the prompt, Claude
+# only reasons over what it's handed. That's fast and cheap, but it isn't
+# an "agent" in the strict sense -- there's no autonomous, iterative
+# decision-making by the model.
+#
+# This section is the real thing: Claude gets two tools (list_directory,
+# read_file) and decides for itself what to explore, in a loop, observing
+# each result before deciding its next move -- until it has enough context
+# to write the report. Slower and more expensive per run (each exploration
+# step is its own API round trip), but it's genuinely agentic.
+# =========================================================================
+
+AGENT_TOOLS = [
+    {
+        "name": "list_directory",
+        "description": (
+            "List files and subdirectories at a path inside the repo, relative "
+            "to the repo root. Use '' or '.' for the root. Noisy directories "
+            "(dependencies, build output, VCS internals) are already filtered out."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Relative path from repo root"},
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "read_file",
+        "description": (
+            "Read the contents of a single text file at a path relative to the "
+            "repo root. Binary files and files that commonly hold secrets "
+            "(.env, credentials, private keys) will be refused. Long files are "
+            "truncated."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Relative path from repo root"},
+            },
+            "required": ["path"],
+        },
+    },
+]
+
+
+def _resolve_within_root(root: Path, rel_path: str) -> Path | None:
+    """Resolve a model-supplied relative path safely inside root.
+    Returns None if the path tries to escape the repo (e.g. '../../etc/passwd')."""
+    candidate = (root / rel_path.strip().lstrip("/")).resolve()
+    try:
+        candidate.relative_to(root.resolve())
+    except ValueError:
+        return None
+    return candidate
+
+
+def tool_list_directory(root: Path, rel_path: str) -> str:
+    target = _resolve_within_root(root, rel_path or ".")
+    if target is None:
+        return "Error: path escapes the repository root -- not allowed."
+    if not target.exists():
+        return f"Error: no such path: {rel_path!r}"
+    if not target.is_dir():
+        return f"Error: {rel_path!r} is a file, not a directory. Use read_file instead."
+
+    entries = []
+    try:
+        for entry in sorted(target.iterdir(), key=lambda p: (p.is_file(), p.name.lower())):
+            if entry.name.startswith(".") and entry.name != ".github":
+                continue
+            if entry.is_dir():
+                if entry.name in SKIP_DIR_NAMES:
+                    continue
+                entries.append(f"{entry.name}/")
+            else:
+                entries.append(entry.name)
+    except PermissionError:
+        return f"Error: permission denied reading {rel_path!r}"
+
+    if not entries:
+        return "(empty directory, or everything here was filtered out)"
+    return "\n".join(entries)
+
+
+def tool_read_file(root: Path, rel_path: str) -> str:
+    target = _resolve_within_root(root, rel_path)
+    if target is None:
+        return "Error: path escapes the repository root -- not allowed."
+    if not target.exists():
+        return f"Error: no such file: {rel_path!r}"
+    if target.is_dir():
+        return f"Error: {rel_path!r} is a directory. Use list_directory instead."
+    if is_probably_secret(target):
+        return (
+            f"Refused: {rel_path!r} matches a pattern commonly used for secrets "
+            f"(credentials, keys, .env files). This tool will not read it."
+        )
+    if not is_probably_text(target):
+        return f"Refused: {rel_path!r} looks like a binary file, not source/text."
+
+    try:
+        text = target.read_text(encoding="utf-8", errors="ignore")
+    except OSError as e:
+        return f"Error reading {rel_path!r}: {e}"
+
+    if len(text) > MAX_CHARS_PER_FILE:
+        text = text[:MAX_CHARS_PER_FILE] + "\n... (truncated)"
+    return text
+
+
+AGENT_SYSTEM_PROMPT = """You are an expert software engineer exploring an unfamiliar codebase to \
+write a technical report for another engineer who has never seen it. You have two tools:
+
+- list_directory(path): list files/subdirectories at a path relative to the repo root
+- read_file(path): read a text file's contents, relative to the repo root
+
+Explore efficiently. A good approach: list the root, read the README and key config/manifest \
+files (package.json, pyproject.toml, Cargo.toml, go.mod, etc.), then read 5-10 of the most \
+important source files based on what you learn. You have a limited tool-call budget -- don't \
+explore exhaustively, prioritize the highest-signal files.
+
+Once you have enough context, STOP calling tools and write your final report as plain text \
+(no further tool calls) in this Markdown format:
+
+## What this project does
+2-4 sentences, plain English.
+
+## Tech stack
+Bullet list of languages, frameworks, and key libraries actually observed.
+
+## Architecture / how it's organized
+Explain the major components/modules and how they relate. Reference real file/directory names \
+you actually read.
+
+## Notable design choices or patterns
+1-3 things a reviewer would find interesting, based on files you actually read -- not generic \
+guesses.
+
+## How to run it
+Best-effort setup/run instructions based on what you saw.
+
+Be concrete and specific -- cite actual file and function/class names you read, not guesses. \
+Keep the whole report under 400 words."""
+
+
+def run_agent(
+    repo_url: str,
+    root: Path,
+    model: str,
+    max_iterations: int = 12,
+    print_live: bool = False,
+) -> str:
+    """The real agentic loop: Claude decides what to explore, calls tools,
+    observes results, and decides its next move -- until it writes the
+    final report or hits the iteration budget."""
+    try:
+        import anthropic
+    except ImportError:
+        print("The 'anthropic' package isn't installed. Run: pip install -r requirements.txt", file=sys.stderr)
+        sys.exit(1)
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        print("Set ANTHROPIC_API_KEY (env var or .env file) to run --agent mode.", file=sys.stderr)
+        sys.exit(1)
+
+    client = anthropic.Anthropic(api_key=api_key)
+    messages = [{"role": "user", "content": f"Repo: {repo_url}\n\nExplore it and write the report."}]
+
+    for iteration in range(1, max_iterations + 1):
+        # On the final allowed iteration, force a written answer instead of
+        # another tool call, so we always end with a real report rather than
+        # silently running out of budget mid-exploration.
+        force_answer = iteration == max_iterations
+        response = client.messages.create(
+            model=model,
+            max_tokens=1500,
+            system=AGENT_SYSTEM_PROMPT,
+            tools=AGENT_TOOLS,
+            tool_choice={"type": "auto"} if not force_answer else {"type": "none"},
+            messages=messages,
+        )
+
+        if response.stop_reason != "tool_use":
+            report = "".join(b.text for b in response.content if hasattr(b, "text"))
+            if print_live:
+                print(report)
+            return report
+
+        messages.append({"role": "assistant", "content": response.content})
+        tool_results = []
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+            path_arg = block.input.get("path", "")
+            if block.name == "list_directory":
+                if print_live:
+                    print(f"  -> list_directory({path_arg!r})", file=sys.stderr)
+                result = tool_list_directory(root, path_arg)
+            elif block.name == "read_file":
+                if print_live:
+                    print(f"  -> read_file({path_arg!r})", file=sys.stderr)
+                result = tool_read_file(root, path_arg)
+            else:
+                result = f"Error: unknown tool {block.name!r}"
+            tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
+        messages.append({"role": "user", "content": tool_results})
+
+    # Should be unreachable: the force_answer branch on the last iteration
+    # always returns. Kept as a safety net.
+    return "Agent ran out of iterations without producing a final report."
+
+
 def main():
     parser = argparse.ArgumentParser(description="Explain a GitHub repo in plain English using Claude.")
     parser.add_argument("repo", help="GitHub repo URL or 'owner/repo' shorthand")
@@ -293,6 +512,21 @@ def main():
         help="Trade speed for detail: longer report (~500 words), bigger "
              "context budget (more files, more content per file). Slower, but "
              "more detailed. The default is the quick (~200 word) report.",
+    )
+    parser.add_argument(
+        "--agent", action="store_true",
+        help="Use a real agentic loop instead of the fixed pipeline: Claude "
+             "itself decides which files to explore, via list_directory/"
+             "read_file tool calls, iterating until it has enough context to "
+             "write the report. Slower and more expensive per run (each "
+             "exploration step is its own API call), but genuinely agentic "
+             "rather than a single call over pre-selected context. Ignores "
+             "--detailed and --dry-run.",
+    )
+    parser.add_argument(
+        "--max-iterations", type=int, default=12,
+        help="With --agent, the max number of tool-call rounds before the "
+             "agent is forced to write its final report (default: 12).",
     )
     args = parser.parse_args()
 
@@ -318,6 +552,15 @@ def main():
         except subprocess.CalledProcessError as e:
             print(f"Failed to clone {repo_url}:\n{e.stderr}", file=sys.stderr)
             sys.exit(1)
+
+        if args.agent:
+            print(f"Agent exploring the repo (up to {args.max_iterations} steps)...", file=sys.stderr)
+            print_live = not args.output
+            report = run_agent(repo_url, tmp_path, args.model, max_iterations=args.max_iterations, print_live=print_live)
+            if args.output:
+                Path(args.output).write_text(report, encoding="utf-8")
+                print(f"Report written to {args.output}", file=sys.stderr)
+            return
 
         print("Scanning repo structure...", file=sys.stderr)
         tree = build_file_tree(tmp_path)

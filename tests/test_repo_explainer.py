@@ -172,3 +172,109 @@ def test_build_prompt_includes_word_limit_and_repo_url():
     )
     assert "https://github.com/pallets/flask.git" in prompt
     assert "under 200 words" in prompt
+
+
+# ---- agent tools (--agent mode) --------------------------------------------
+# These are the tools handed to the model in agentic mode. Since the model
+# supplies the paths, path-traversal safety here is the highest-risk surface
+# in the whole project -- a malicious or confused "../../etc/passwd" request
+# must never escape the cloned repo directory.
+
+def test_resolve_within_root_allows_normal_relative_paths(tmp_path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.py").write_text("x = 1")
+
+    resolved = re_mod._resolve_within_root(tmp_path, "src/main.py")
+
+    assert resolved == (tmp_path / "src" / "main.py").resolve()
+
+
+@pytest.mark.parametrize(
+    "escape_attempt",
+    ["../../etc/passwd", "../outside.txt", "src/../../../etc/passwd"],
+)
+def test_resolve_within_root_blocks_path_traversal(tmp_path, escape_attempt):
+    # These use enough '../' to walk past the root even after the leading-
+    # slash strip, so they must be rejected outright.
+    assert re_mod._resolve_within_root(tmp_path, escape_attempt) is None
+
+
+def test_resolve_within_root_treats_leading_slash_as_repo_relative(tmp_path):
+    # A model-supplied path starting with '/' is NOT treated as an absolute
+    # filesystem path -- the leading slash is stripped and it's resolved
+    # relative to the repo root instead. That keeps it safely contained;
+    # it just means "/etc/passwd" resolves to "<root>/etc/passwd" (which
+    # won't exist) rather than escaping to the real /etc/passwd.
+    resolved = re_mod._resolve_within_root(tmp_path, "/etc/passwd")
+    assert resolved is not None
+    assert resolved.is_relative_to(tmp_path.resolve())
+
+
+def test_tool_list_directory_lists_root(tmp_path):
+    (tmp_path / "README.md").write_text("# hi")
+    (tmp_path / "src").mkdir()
+
+    result = re_mod.tool_list_directory(tmp_path, ".")
+
+    assert "README.md" in result
+    assert "src/" in result
+
+
+def test_tool_list_directory_skips_noise_dirs(tmp_path):
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "README.md").write_text("# hi")
+
+    result = re_mod.tool_list_directory(tmp_path, ".")
+
+    assert "node_modules" not in result
+    assert "README.md" in result
+
+
+def test_tool_list_directory_rejects_path_escape(tmp_path):
+    result = re_mod.tool_list_directory(tmp_path, "../../etc")
+    assert "Error" in result
+    assert "not allowed" in result
+
+
+def test_tool_list_directory_reports_missing_path(tmp_path):
+    result = re_mod.tool_list_directory(tmp_path, "does_not_exist")
+    assert "Error" in result
+
+
+def test_tool_read_file_returns_contents(tmp_path):
+    (tmp_path / "main.py").write_text("print('hello')")
+
+    result = re_mod.tool_read_file(tmp_path, "main.py")
+
+    assert result == "print('hello')"
+
+
+def test_tool_read_file_refuses_secret_files(tmp_path):
+    (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=sk-ant-should-not-leak")
+
+    result = re_mod.tool_read_file(tmp_path, ".env")
+
+    assert "Refused" in result
+    assert "sk-ant-should-not-leak" not in result
+
+
+def test_tool_read_file_refuses_path_escape(tmp_path):
+    result = re_mod.tool_read_file(tmp_path, "../../etc/passwd")
+    assert "Error" in result
+    assert "not allowed" in result
+
+
+def test_tool_read_file_truncates_long_files(tmp_path):
+    f = tmp_path / "big.py"
+    f.write_text("x" * (re_mod.MAX_CHARS_PER_FILE + 500))
+
+    result = re_mod.tool_read_file(tmp_path, "big.py")
+
+    assert len(result) <= re_mod.MAX_CHARS_PER_FILE + len("\n... (truncated)")
+    assert result.endswith("... (truncated)")
+
+
+def test_tool_read_file_reports_directory_instead_of_file(tmp_path):
+    (tmp_path / "src").mkdir()
+    result = re_mod.tool_read_file(tmp_path, "src")
+    assert "directory" in result.lower()

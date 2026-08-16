@@ -13,8 +13,39 @@ filtering, a heuristic for picking the highest-signal files, and a hard
 character budget to keep every request within a sane context size, all
 coordinated around a single well-crafted call to Claude.
 
+## Two modes: fixed pipeline vs. a real agentic loop
+
+There are two ways this tool explores a repo, and they're architecturally
+different -- worth understanding, not just a flag name.
+
+**Default mode** is a fixed pipeline: Python decides which files matter
+(`collect_file_contents`), Python builds the prompt, and Claude is called
+exactly once to reason over the context it's handed. Fast, cheap, and
+deterministic -- but the model itself isn't making exploration decisions.
+
+**`--agent` mode** is a real tool-use loop: Claude gets two tools,
+`list_directory` and `read_file`, and decides for itself what to look at --
+observing each result before choosing its next move, iterating until it has
+enough context to write the report. Slower and more expensive per run (each
+exploration step is its own API call, capped at `--max-iterations`, default
+12), but it's genuinely agentic: the model is doing the exploring, not
+Python.
+
+```bash
+# Fixed pipeline (fast, default)
+python repo_explainer.py pallets/flask
+
+# Real agentic loop -- watch it decide what to explore
+python repo_explainer.py pallets/flask --agent
+```
+
+In `--agent` mode, each tool call the model makes is printed live to stderr
+(`-> read_file('src/flask/app.py')`, etc.) so you can watch its exploration
+path in real time.
+
 ## What it does
 
+**Default mode:**
 1. Clones the target repo (shallow, read-only).
 2. Walks the file tree, skipping build artifacts, dependencies, and binaries.
 3. Picks a representative, budget-limited set of files (README, config files,
@@ -23,6 +54,11 @@ coordinated around a single well-crafted call to Claude.
    to explain the project like a senior engineer onboarding a teammate.
 5. Prints (or saves) a Markdown report with: what the project does, its
    tech stack, its architecture, notable design choices, and how to run it.
+
+**`--agent` mode:** same clone step, then Claude itself calls
+`list_directory`/`read_file` in a loop -- typically listing the root,
+reading the README and manifest files, then reading whichever source files
+it decides matter most -- before writing the same report format.
 
 ## Setup
 
@@ -49,11 +85,16 @@ python repo_explainer.py pallets/flask --dry-run
 
 # Get a longer, more detailed report (slower, bigger context budget)
 python repo_explainer.py pallets/flask --detailed
+
+# Real agentic loop -- Claude decides what to explore (see above)
+python repo_explainer.py pallets/flask --agent
+python repo_explainer.py pallets/flask --agent --max-iterations 20
 ```
 
 By default the report is quick (~200 words, a smaller slice of the repo sent
 to the model). Pass `--detailed` for a longer, more detailed analysis at the
-cost of a slower response.
+cost of a slower response. `--agent` ignores both `--detailed` and
+`--dry-run` -- it's a different execution path entirely.
 
 `owner/repo` shorthand works too, not just full URLs.
 
@@ -76,9 +117,13 @@ The core app lives in `src/flask/app.py`, defining the `Flask` class...
 ## Testing
 
 The deterministic logic (URL parsing, secret-file filtering, file-tree
-building, the file-selection heuristic) has unit test coverage in `tests/`.
-The API call itself isn't unit tested since it requires network access and
-a key -- use `--dry-run` to sanity-check the prompt it would send instead.
+building, the file-selection heuristic) has unit test coverage in `tests/`,
+including the `--agent` mode's tools -- in particular the path-traversal
+safety check (`_resolve_within_root`), since a model-supplied file path is
+the highest-risk input surface in the whole project. The API calls
+themselves aren't unit tested since they require network access and a key
+-- use `--dry-run` (default mode) to sanity-check the prompt it would send
+instead.
 
 ```bash
 pip install -r requirements-dev.txt
@@ -99,9 +144,13 @@ oriented in unfamiliar repos before diving in.
 ## Limitations / next steps
 
 - Only handles public repos (no auth for private repos yet).
-- File selection is heuristic (prioritizes README/config/entry points) —
-  very large or unconventionally structured repos may get an incomplete
-  picture.
+- Default mode's file selection is heuristic (prioritizes README/config/entry
+  points) — very large or unconventionally structured repos may get an
+  incomplete picture. `--agent` mode addresses this by letting the model
+  explore adaptively instead, at the cost of speed and API spend.
+- `--agent` mode's iteration budget (`--max-iterations`) is a blunt
+  instrument -- it caps cost/time but doesn't let the model signal "I need
+  more room" vs. "I'm confident with what I've seen."
 - Could be extended with: a simple web UI, support for private repos via a
   GitHub token, or a "compare two repos" mode.
 
