@@ -264,19 +264,19 @@ def main():
     parser.add_argument("--model", default=MODEL, help=f"Claude model to use (default: {MODEL})")
     parser.add_argument("--dry-run", action="store_true", help="Build the prompt but skip the API call (no key needed)")
     parser.add_argument(
-        "--fast", action="store_true",
-        help="Trade thoroughness for speed: shorter report (~200 words), smaller "
-             "context budget (fewer files, less content per file). Good for quick "
-             "demos; use the default for a more thorough analysis.",
+        "--thorough", action="store_true",
+        help="Trade speed for thoroughness: longer report (~500 words), bigger "
+             "context budget (more files, more content per file). Slower, but "
+             "more detailed. The default is the quick (~200 word) report.",
     )
     args = parser.parse_args()
 
-    if args.fast:
-        word_limit, max_tokens = 200, 700
-        max_files, max_total_chars = 12, 20000
-    else:
+    if args.thorough:
         word_limit, max_tokens = 500, 2000
         max_files, max_total_chars = MAX_FILES_TO_INCLUDE, MAX_TOTAL_PROMPT_CHARS
+    else:
+        word_limit, max_tokens = 200, 700
+        max_files, max_total_chars = 12, 20000
 
     try:
         from dotenv import load_dotenv
